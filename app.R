@@ -13,6 +13,7 @@ library(googlesheets4)
 library(googledrive)
 library(gargle)
 library(lubridate)
+library(ggiraph)
 
 # set up google sheets options
 #options(
@@ -54,13 +55,28 @@ ui <- page_sidebar(
   navset_tab(
     id = "tabs",
     nav_panel("Sleep Raster Plot", value = "sleep", plotOutput("sleepPlot", height = "600px")),
-    nav_panel("Activity Time Plot", value = "activity", plotOutput("activityPlot", height = "600px")),
+    nav_panel("Activity Time Plot", value = "activity", girafeOutput("activityPlot", width = "100%", height = "600px")),
     nav_panel("Compare States", value = "compare", plotOutput("comparePlot", height = "600px")),
     nav_panel("Data Table", value = "table", DTOutput("sleepTable"))
   )
 )
 
+# Functions
 
+# define birth date of the baby
+birth_date <- as.Date("2026-08-09")
+
+# Which life month does a date fall into?
+# Month 1 = birth_date until (birth_date + 1 month) - 1 day, etc.
+life_month_of <- function(d) {
+  d <- as.Date(d)
+  n <- interval(birth_date, d) %/% months(1) + 1L
+  n
+}
+
+# Start and end dates of life month n
+life_month_start <- function(n) birth_date %m+% months(n - 1)
+life_month_end   <- function(n) birth_date %m+% months(n) - 1   # day before next anniversary
 # ---- Server Logic ----
 server <- function(input, output, session) {
   
@@ -84,18 +100,16 @@ server <- function(input, output, session) {
           panel.grid       = element_line(color = "#444444")
         )
     } else {
-      ggprism::theme_prism(base_size = base_size,
-                           base_line_size = 0.5,
-                           base_fontface = "plain",
-                           base_family = "sans")
+      theme_minimal()
     }
   }
   
   tryCatch({# --- 1. Load and Clean Data from Google Sheets ---
     raw_data <- reactive({
-      # Read both sheets (assume first two sheets are relevant)
+      # Read all sheets and combine them into one data frame
       sheet1 <- read_sheet(SHEET_ID, sheet = 1, col_types = "Dctttt")
       sheet2 <- read_sheet(SHEET_ID, sheet = 2, col_types = "Dctttt")
+      sheet3 <- read_sheet(SHEET_ID, sheet = 3, col_types = "Dctttt")
       # Standardize columns and types
       clean_sheet <- function(df) {
         df |>
@@ -173,14 +187,36 @@ server <- function(input, output, session) {
     updateSelectInput(session, "status_filter", choices = c("All", statuses))
   })
   
-  birth_date <- as.Date("2026-08-09")
+  # --- 4. UI Dynamic Choices for Month Filter ---
+ 
   observe({
-    # Calculate the month number based on the selected date range
-    start_month <- as.numeric(difftime(input$date_range[1], birth_date, units = "days")) %/% 30 + 1
-    end_month <- as.numeric(difftime(input$date_range[2], birth_date, units = "days")) %/% 30 + 1
+    # 1. Compute "month number" for the start and end of the selected date range
+    start_month <- life_month_of(input$date_range[1])
+    end_month   <- life_month_of(input$date_range[2])
+    
+    # Guard against reversed ranges
+    if (start_month > end_month) {
+      showNotification("Start date is after end date.", type = "error")
+      return()
+    }
+    
+    # 2. Build a sequence of month numbers between start and end
     months <- seq(start_month, end_month)
-    month_choices <- c("All", paste0("Month ", months))
-    updateSelectInput(session, "select_month", choices = month_choices)
+    
+    # 3. Create labels: "All", "Month 1", "Month 2", ...
+    choices <- setNames(
+      as.list(c("All", months)),                       # values
+      c("All", paste0("Month ", months, " (", format(life_month_start(months), "%d %b"),
+                      " \u2013 ", format(life_month_end(months), "%d %b %Y"), ")")     # labels
+    )
+    )
+    
+    # Preserve the user's current selection if it is still valid
+    current <- input$select_month
+    selected <- if (!is.null(current) && current %in% choices) current else "All"
+    
+    # 4. Update the selectInput dropdown with these choices
+    updateSelectInput(session, "select_month", choices = choices, selected = selected)
   })
   
   # --- 5. Filtered Data for Plot/Table ---
@@ -192,9 +228,11 @@ server <- function(input, output, session) {
     if (input$status_filter != "All") {
       df <- df[Status == input$status_filter]
     }
+    # Filter by month if not "All"
     if (input$select_month != "All") {
-      selected_month <- as.numeric(gsub("Month ", "", input$select_month))
-      df <- df[as.numeric(difftime(date, birth_date, units = "days")) %/% 30 + 1 == selected_month]
+     
+      selected_month <- as.integer(input$select_month)
+      df <- df[life_month_of(date) == selected_month]
     }
     df
   })
@@ -214,43 +252,92 @@ server <- function(input, output, session) {
         name = "State"
       ) +
       scale_y_datetime(date_breaks = "2 hour", date_labels = "%H:%M") +
-      scale_x_date(date_minor_breaks = "1 day", date_breaks = "2 days", date_labels = "%d %b") +
+      scale_x_date(date_minor_breaks = "1 day", date_breaks = "5 days", date_labels = "%d %b") +
       labs(x = "Date", y = "Time") +
       ggtitle("Visualization of Richard's sleeping patterns") +
-      theme_app(is_dark())          # <-- reactive theme
+      theme_app(is_dark())+          # <-- reactive theme
+      theme(axis.text.x = element_text(angle = 90, hjust = 1))  # Rotate x-axis labels)
 })
   
   # --- Count States ---
   
-  output$activityPlot <- renderPlot({
+  output$activityPlot <- renderGirafe({
     df <- filtered_data()
-    df |> 
+    
+    plot_df <- df |>
       group_by(date) |>
       count(Status) |>
       pivot_wider(names_from = Status, values_from = n) |>
       mutate(across(c(Wach, Essen, Schlaf), ~ . / 60)) |>
-      pivot_longer(cols = c(Essen, Wach, Schlaf), names_to = "State", values_to = "Hours") |>
-      ggplot(aes(x=date, y=Hours, group = State, color = State)) + 
-      geom_line(lwd = 1,      # Width of the line
-                linetype = 1) +
-      geom_point(size = 2) +
+      pivot_longer(cols = c(Essen, Wach, Schlaf),
+                   names_to = "State", values_to = "Hours") |>
+      mutate(
+        tooltip = paste0(
+          "<b>", format(date, "%d %b %Y"), "</b><br>",
+          "State: ", State, "<br>",
+          "Hours: ", sprintf("%.1f", Hours)
+        )
+      )
+    
+    p <- ggplot(plot_df, aes(x = date, y = Hours, group = State, color = State)) +
+      geom_line_interactive(lwd = 1, linetype = 1) +
+      geom_point_interactive(
+        aes(tooltip = tooltip, data_id = date,
+            onclick = sprintf("Shiny.setInputValue('pt_click', '%s')", date)),
+       # ← tooltip + hover identity
+        size = 2
+      ) +
       geom_boxplot(aes(x = max(df$date) + 7, y = Hours, fill = State),
-                   width = 2,
-                   alpha = 0.4,
-                   outlier.shape = 21
-      )+
-      scale_color_manual(values = c("Essen" = "coral3", "Wach" = "darksalmon", "Schlaf" = "darkseagreen"))+
-      scale_fill_manual(values = c("Essen" = "coral3", "Wach" = "darksalmon", "Schlaf" = "darkseagreen"))+
-      scale_y_continuous(breaks = seq(0, 24, by = 2))+
-      #theme_minimal() +
-      #ggprism::theme_prism(base_size = 12, base_line_size = 0.5, base_fontface = "plain", base_family = "sans")+
-      scale_x_date(date_minor_breaks = "1 day", breaks = c(seq(from = min(df$date), to = max(df$date), by = "5 days"),rep("", each = 6)), date_labels = "%d %b") +
+                   width = 2, alpha = 0.4, outlier.shape = 21) +
+      scale_color_manual(values = c("Essen" = "coral3", "Wach" = "darksalmon", "Schlaf" = "darkseagreen")) +
+      scale_fill_manual(values = c("Essen" = "coral3", "Wach" = "darksalmon", "Schlaf" = "darkseagreen")) +
+      scale_y_continuous(breaks = seq(0, 24, by = 2)) +
+      scale_x_date(
+        date_minor_breaks = "1 day",
+        breaks = seq(from = min(df$date), to = max(df$date), by = "5 days"),
+        date_labels = "%d %b"
+      ) +
       labs(x = "Datum", y = "Stunden") +
-      ggtitle("Richards Aktivitäten pro Tag")+
-      theme_app(is_dark())          # <-- reactive theme
-    })
+      ggtitle("Richards Aktivitäten pro Tag") +
+      theme_app(is_dark()) +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1))
+    
+    girafe(
+      ggobj = p,
+      width_svg  = 10,
+      height_svg = 5,
+      options = list(
+        opts_tooltip(css = "padding:5px;background:rgba(0,0,0,0.8);color:white;"),
+        opts_hover(css = "stroke-width:3")   # highlight on hover
+      )
+    )
+  })
+  
+  observeEvent(input$pt_click, {
+    clicked_date <- as.Date(input$pt_click)
+    details <- filtered_data() |> filter(date == clicked_date)
+    showModal(modalDialog(
+      title = paste("Details for", format(clicked_date, "%d %b %Y")),
+      renderTable(details),
+      easyClose = TRUE
+    ))
+  })
   
   # --- 8. Interactive Data Table ---
+  
+  format_hours <- function(x) {
+    # Handle NA and missing columns gracefully
+    out <- rep(NA_character_, length(x))
+    valid <- !is.na(x)
+    
+    total_minutes <- round(x[valid] * 60)        # round to nearest minute
+    h <- total_minutes %/% 60
+    m <- total_minutes %% 60
+    
+    out[valid] <- paste0(h, "h", sprintf("%02d", m), "min")
+    out
+  }
+  
   output$sleepTable <- renderDT({
     df <- filtered_data()
     df %>%
@@ -258,7 +345,8 @@ server <- function(input, output, session) {
       count(Status) |>
       pivot_wider(names_from = Status, values_from = n) |>
       mutate(across(c(Wach, Essen, Schlaf), ~ . / 60)) |>
-      mutate_if(is.numeric, ~ round(., digits = 1))
+      # Replace the old round() with the formatted strings
+      mutate(across(any_of(c("Wach", "Essen", "Schlaf")), format_hours))
   })
   
   # --- Compare States: Staircase Plot ---
@@ -303,7 +391,7 @@ server <- function(input, output, session) {
      
       coord_cartesian(xlim = c(0, 1440)) +
       scale_color_manual(values = c("Essen" = "coral3", "Wach" = "darksalmon", "Schlaf" = "darkseagreen"))+
-      #theme_minimal() +
+      scale_y_continuous(breaks = seq(0, 24, by = 2))+
       labs(
         x = 'Time of Day',
         y = 'Cumulative Hours',
@@ -311,7 +399,8 @@ server <- function(input, output, session) {
         linetype = 'Day',
         title = 'Vergleich der Zustände (Staircase Plot)'
       ) +
-      theme_app(is_dark())          # <-- reactive theme
+      theme_app(is_dark()) +          # <-- reactive theme
+      theme(axis.text.x = element_text(angle = 90, hjust = 1))  # Rotate x-axis labels
   })
 }
 
