@@ -54,9 +54,9 @@ ui <- page_sidebar(
   ),
   navset_tab(
     id = "tabs",
-    nav_panel("Sleep Raster Plot", value = "sleep", plotOutput("sleepPlot", height = "600px")),
+    nav_panel("Sleep Raster Plot", value = "sleep", girafeOutput("sleepPlot", width = "100%", height = "600px")),
     nav_panel("Activity Time Plot", value = "activity", girafeOutput("activityPlot", width = "100%", height = "600px")),
-    nav_panel("Compare States", value = "compare", plotOutput("comparePlot", height = "600px")),
+    nav_panel("Compare States", value = "compare", girafeOutput("comparePlot", width= "100%", height = "600px")),
     nav_panel("Data Table", value = "table", DTOutput("sleepTable"))
   )
 )
@@ -121,7 +121,7 @@ server <- function(input, output, session) {
           ) |>
           fill(Datum, .direction = "down")
       }
-      bind_rows(clean_sheet(sheet1), clean_sheet(sheet2)) |>
+      bind_rows(clean_sheet(sheet1), clean_sheet(sheet2), clean_sheet(sheet3)) |>
         filter(!is.na(Status))
     })
   }, error = function(e) {
@@ -238,25 +238,127 @@ server <- function(input, output, session) {
   })
   
   # --- 6. Raster/Tile Plot (Date × Time-of-Day) ---
-  output$sleepPlot <- renderPlot({
-    df <- filtered_data()
-    df |>
-      mutate(
-        time = as.POSIXct(time, format = "%H:%M", tz = "UTC")  # Convert time to POSIXct
-      ) |>
-      ggplot(aes(x = date, y = time, fill = Status)) +
-      geom_tile() +
-      #ggprism::theme_prism(base_size = 12, base_line_size = 0.5, base_fontface = "plain", base_family = "sans") +
-      scale_fill_manual(
-        values = c("Schlaf" = "skyblue4", "Essen" = "tan3", "Wach" = "tan", "NA" = "grey80"),
-        name = "State"
-      ) +
-      scale_y_datetime(date_breaks = "2 hour", date_labels = "%H:%M") +
-      scale_x_date(date_minor_breaks = "1 day", date_breaks = "5 days", date_labels = "%d %b") +
-      labs(x = "Date", y = "Time") +
-      ggtitle("Visualization of Richard's sleeping patterns") +
-      theme_app(is_dark())+          # <-- reactive theme
-      theme(axis.text.x = element_text(angle = 90, hjust = 1))  # Rotate x-axis labels)
+#   output$sleepPlot <- renderGirafe({
+#     df <- filtered_data()
+#     
+#     plot_df <- df |>
+#       mutate(
+#         time = as.POSIXct(time, format = "%H:%M", tz = "UTC")  # Convert time to POSIXct
+#       )
+#     
+#     
+#     
+#     plot_sleep <- plot_df |>
+#       ggplot(aes(x = date, y = time, fill = Status)) +
+#       geom_tile_interactive(aes(data_id = Status), hover_nearest = TRUE) +
+#       #ggprism::theme_prism(base_size = 12, base_line_size = 0.5, base_fontface = "plain", base_family = "sans") +
+#       scale_fill_manual_interactive(
+#         values = c("Schlaf" = "skyblue4", "Essen" = "tan3", "Wach" = "tan", "NA" = "grey80"),
+#         name = "State"
+#       ) +
+#       scale_y_datetime(date_breaks = "2 hour", date_labels = "%H:%M") +
+#       scale_x_date(date_minor_breaks = "1 day", date_breaks = "5 days", date_labels = "%d %b") +
+#       labs(x = "Date", y = "Time") +
+#       ggtitle("Visualization of Richard's sleeping patterns") +
+#       theme_app(is_dark())+          # <-- reactive theme
+#       theme(axis.text.x = element_text(angle = 90, hjust = 1))  # Rotate x-axis labels)
+#     
+#     girafe(
+#       ggobj = plot_sleep,
+#       width_svg  = 10,
+#       height_svg = 5,
+#       options = list(
+#         opts_sizing(rescale = TRUE),
+#         #opts_tooltip(use_fill = TRUE, linked = TRUE), # "padding:5px;background:rgba(0,0,0,0.8);color:white;"
+#         opts_hover(css = "stroke-width:2"), # highlight on hover
+#         opts_hover_inv(css = "opacity:0.1;")
+#       )
+#     )
+# })
+#   
+  
+# --- 6. Raster/Tile Plot (Date × Time-of-Day) ---
+  output$sleepPlot <- renderGirafe({
+     df <- filtered_data()
+       
+  # ---------------------------------------------------------------
+  # 1. RLE: collapse contiguous runs of the same Status per day
+  # ---------------------------------------------------------------
+  runs <- df |>
+    mutate(
+      # "HH:MM" -> minutes since midnight
+      minute = as.integer(substr(time, 1, 2)) * 60L +
+        as.integer(substr(time, 4, 5)),
+      # Treat untracked minutes (NA) as their own category so runs don't break
+      Status = ifelse(is.na(Status), "Untracked", Status)
+    ) |>
+    arrange(date, minute) |>
+    group_by(date) |>
+    # A new run starts whenever the Status changes vs. the previous minute
+    mutate(run_id = cumsum(Status != lag(Status, default = first(Status)))) |>
+    group_by(date, Status, run_id) |>
+    summarise(
+      start_min = min(minute),
+      end_min   = max(minute) + 1L,   # run extends up to the next minute boundary
+      .groups   = "drop"
+    ) |>
+    mutate(
+      # --- Map minutes onto a FIXED reference day for the y-axis ---
+      # (all runs share the same date on the y-axis, like your original plot)
+      start_dt = as.POSIXct("2026-01-01 00:00", format = "%Y-%m-%d %H:%M", tz = "UTC") + start_min * 60,
+      end_dt   = as.POSIXct("2026-01-01 00:00", format = "%Y-%m-%d %H:%M", tz = "UTC") + end_min * 60,
+      # --- Tooltip and interactive id per RUN (not per minute) ---
+      tooltip = paste0(
+        "<b>", format(date, "%d %b %Y"), "</b><br>",
+        sprintf("%02d:%02d", start_min %/% 60, start_min %% 60), " \u2013 ",
+        sprintf("%02d:%02d", end_min   %/% 60, end_min   %% 60), "<br>",
+        "Status: ", Status
+      ),
+      data_id = Status
+    )
+  
+  # ---------------------------------------------------------------
+  # 2. Plot: one interactive rectangle per run
+  # ---------------------------------------------------------------
+  plot_sleep <- ggplot(runs, aes(xmin = date - 0.5, xmax = date + 0.5,
+                                 ymin = start_dt,  ymax = end_dt,
+                                 fill = Status)) +
+    geom_rect_interactive(aes(tooltip = tooltip, data_id = data_id),
+                          color = NA) +
+    scale_fill_manual_interactive(
+      values = c("Schlaf"     = "skyblue4",
+                 "Essen"      = "tan3",
+                 "Wach"       = "tan",
+                 "Untracked"  = "grey80"),
+      name = "State",
+      data_id = function(breaks) breaks,     # each legend key gets its category name as data_id
+      tooltip = function(breaks) breaks      # each legend key shows its category name on hover
+    ) +
+    scale_y_datetime(date_breaks = "2 hour", date_labels = "%H:%M") +
+    scale_x_date(date_minor_breaks = "1 day",
+                 date_breaks = "5 days",
+                 date_labels = "%d %b") +
+    labs(x = "Date", y = "Time") +
+    ggtitle("Visualization of Richard's sleeping patterns") +
+    theme_app(is_dark()) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  
+  # ---------------------------------------------------------------
+  # 3. girafe with performance-friendly options
+  # ---------------------------------------------------------------
+  girafe(
+    ggobj = plot_sleep,
+    width_svg  = 10,
+    height_svg = 5,
+    options = list(
+      opts_sizing(rescale = TRUE),          # avoid expensive browser rescaling
+      opts_tooltip(css = "padding:5px;background:rgba(0,0,0,0.8);color:white;"),
+      opts_hover(css = "stroke-width:2", 
+                 linked = TRUE),     # highlight the hovered run
+      opts_hover_key(css = "stroke-width:2"),
+      opts_hover_inv(css = "opacity:0.1;") 
+    )
+  )
 })
   
   # --- Count States ---
@@ -279,13 +381,14 @@ server <- function(input, output, session) {
         )
       )
     
-    p <- ggplot(plot_df, aes(x = date, y = Hours, group = State, color = State)) +
+    plot_states <- ggplot(plot_df, aes(x = date, y = Hours, group = State, color = State)) +
       geom_line_interactive(lwd = 1, linetype = 1) +
       geom_point_interactive(
         aes(tooltip = tooltip, data_id = date,
             onclick = sprintf("Shiny.setInputValue('pt_click', '%s')", date)),
        # ← tooltip + hover identity
-        size = 2
+        size = 2,
+       hover_nearest = TRUE
       ) +
       geom_boxplot(aes(x = max(df$date) + 7, y = Hours, fill = State),
                    width = 2, alpha = 0.4, outlier.shape = 21) +
@@ -303,12 +406,13 @@ server <- function(input, output, session) {
       theme(axis.text.x = element_text(angle = 90, hjust = 1))
     
     girafe(
-      ggobj = p,
+      ggobj = plot_states,
       width_svg  = 10,
       height_svg = 5,
       options = list(
-        opts_tooltip(css = "padding:5px;background:rgba(0,0,0,0.8);color:white;"),
-        opts_hover(css = "stroke-width:3")   # highlight on hover
+        opts_sizing(rescale = TRUE),
+        opts_tooltip(use_fill = TRUE), # "padding:5px;background:rgba(0,0,0,0.8);color:white;"
+        opts_hover(css = "stroke-width:5")   # highlight on hover
       )
     )
   })
@@ -350,7 +454,7 @@ server <- function(input, output, session) {
   })
   
   # --- Compare States: Staircase Plot ---
-  output$comparePlot <- renderPlot({
+  output$comparePlot <- renderGirafe({
     today_utc <- lubridate::today(tzone = "UTC")
     validate(need(!is.null(input$compare_date), "Choose day to compare!"))
     validate(need(input$compare_date != today_utc, "Choose different day than today!"))
@@ -379,19 +483,17 @@ server <- function(input, output, session) {
     comparison_label <- as.character(input$compare_date)
     linetype_vals <- setNames(c('solid', 'dashed'), c('Today', comparison_label))
     
-    ggplot(cum_df, aes(x = minute_of_day, y = cum_hours, color = Status, linetype = Label)) +
-      
-      geom_step(linewidth = 1.2) +
+    plot_compare <- ggplot(cum_df, aes(x = minute_of_day, y = cum_hours, color = Status, linetype = Label)) +
+      geom_step_interactive(aes(data_id = Status), linewidth = 1.2, hover_nearest = TRUE) +
       scale_linetype_manual(values = linetype_vals) +
       scale_x_continuous(
         breaks = seq(0, 1440, by = 120),
         labels = function(x) sprintf('%02d:%02d', x %/% 60, x %% 60),
         expand = c(0, 0)
       ) +
-     
       coord_cartesian(xlim = c(0, 1440)) +
       scale_color_manual(values = c("Essen" = "coral3", "Wach" = "darksalmon", "Schlaf" = "darkseagreen"))+
-      scale_y_continuous(breaks = seq(0, 24, by = 2))+
+      scale_y_continuous(breaks = seq(0, 24, by = 2)) +
       labs(
         x = 'Time of Day',
         y = 'Cumulative Hours',
@@ -401,6 +503,17 @@ server <- function(input, output, session) {
       ) +
       theme_app(is_dark()) +          # <-- reactive theme
       theme(axis.text.x = element_text(angle = 90, hjust = 1))  # Rotate x-axis labels
+    
+    girafe(
+      ggobj = plot_compare,
+      width_svg  = 10,
+      height_svg = 5,
+      options = list(
+        opts_sizing(rescale = TRUE),
+        opts_hover(css = "stroke-width:4;"),
+        opts_hover_inv(css = "opacity:0.1;")
+      )
+    )
   })
 }
 
